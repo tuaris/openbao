@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -784,7 +785,7 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	// Create the autopilot instance
 	options := []autopilot.Option{
 		autopilot.WithLogger(b.logger),
-		autopilot.WithPromoter(autopilot.DefaultPromoter()),
+		autopilot.WithPromoter(&CustomPromoter{}),
 	}
 	if b.autopilotReconcileInterval != 0 {
 		options = append(options, autopilot.WithReconcileInterval(b.autopilotReconcileInterval))
@@ -802,4 +803,57 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	b.autopilot.Start(ctx)
 
 	go b.startFollowerHeartbeatTracker()
+}
+
+type CustomPromoter struct{}
+
+func (_ *CustomPromoter) GetServerExt(_ *autopilot.Config, srv *autopilot.ServerState) interface{} {
+	return nil
+}
+
+func (_ *CustomPromoter) GetStateExt(_ *autopilot.Config, _ *autopilot.State) interface{} {
+	return nil
+}
+
+func (_ *CustomPromoter) GetNodeTypes(_ *autopilot.Config, s *autopilot.State) map[raft.ServerID]autopilot.NodeType {
+	types := make(map[raft.ServerID]autopilot.NodeType)
+	for id := range s.Servers {
+		// If the server has a ["non-voter"] suffix, it's a non-voter
+		if strings.HasSuffix(string(id), "[non-voter]") {
+			types[id] = autopilot.NodeType("non-voter")
+		} else {
+			types[id] = autopilot.NodeVoter
+		}
+	}
+	return types
+}
+
+func (_ *CustomPromoter) FilterFailedServerRemovals(_ *autopilot.Config, _ *autopilot.State, failed *autopilot.FailedServers) *autopilot.FailedServers {
+	return failed
+}
+
+// CalculatePromotionsAndDemotions will return a list of all promotions and demotions to be done as well as the server id of
+// the desired leader. This particular interface implementation maintains a stable leader and will promote healthy servers
+// to voting status if they don't have a "[non-voter]" suffix. It will never change the leader ID nor will it perform demotions.
+func (_ *CustomPromoter) CalculatePromotionsAndDemotions(c *autopilot.Config, s *autopilot.State) autopilot.RaftChanges {
+	var changes autopilot.RaftChanges
+
+	now := time.Now()
+	minStableDuration := s.ServerStabilizationTime(c)
+	for id, server := range s.Servers {
+		// ignore non-voters
+		if strings.HasSuffix(string(id), "[non-voter]") {
+			continue
+		}
+		// ignore staging state as they are not ready yet
+		if server.State == autopilot.RaftNonVoter && server.Health.IsStable(now, minStableDuration) {
+			changes.Promotions = append(changes.Promotions, id)
+		}
+	}
+
+	return changes
+}
+
+func (_ *CustomPromoter) IsPotentialVoter(nodeType autopilot.NodeType) bool {
+	return nodeType == autopilot.NodeVoter
 }
