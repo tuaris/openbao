@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	autopilot "github.com/hashicorp/raft-autopilot"
 	"github.com/mitchellh/mapstructure"
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/sdk/v2/physical"
 	"go.uber.org/atomic"
 )
 
@@ -264,16 +266,18 @@ type Delegate struct {
 	*RaftBackend
 
 	// dl is a lock dedicated for guarding delegate's fields
-	dl               sync.RWMutex
-	inflightRemovals map[raft.ServerID]bool
-	emptyVersionLogs map[raft.ServerID]struct{}
+	dl                 sync.RWMutex
+	inflightRemovals   map[raft.ServerID]bool
+	emptyVersionLogs   map[raft.ServerID]struct{}
+	permanentNonVoters map[raft.ServerID]bool
 }
 
 func NewDelegate(b *RaftBackend) *Delegate {
 	return &Delegate{
-		RaftBackend:      b,
-		inflightRemovals: make(map[raft.ServerID]bool),
-		emptyVersionLogs: make(map[raft.ServerID]struct{}),
+		RaftBackend:        b,
+		inflightRemovals:   make(map[raft.ServerID]bool),
+		emptyVersionLogs:   make(map[raft.ServerID]struct{}),
+		permanentNonVoters: make(map[raft.ServerID]bool),
 	}
 }
 
@@ -805,6 +809,9 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	go b.startFollowerHeartbeatTracker()
 }
 
+// Ensure that the CustomPromoter implements the autopilot.Promoter interface
+var _ autopilot.Promoter = (*CustomPromoter)(nil)
+
 type CustomPromoter struct{}
 
 func (_ *CustomPromoter) GetServerExt(_ *autopilot.Config, srv *autopilot.ServerState) interface{} {
@@ -856,4 +863,79 @@ func (_ *CustomPromoter) CalculatePromotionsAndDemotions(c *autopilot.Config, s 
 
 func (_ *CustomPromoter) IsPotentialVoter(nodeType autopilot.NodeType) bool {
 	return nodeType == autopilot.NodeVoter
+}
+
+func (d *Delegate) AddNonVoter(id raft.ServerID) error {
+	d.dl.Lock()
+	d.permanentNonVoters[id] = true
+	d.dl.Unlock()
+
+	return d.updateNonVoters()
+}
+
+func (d *Delegate) IsNonVoter(id raft.ServerID) bool {
+	d.dl.RLock()
+	defer d.dl.RUnlock()
+	if _, ok := d.permanentNonVoters[id]; ok {
+		return true
+	}
+	return false
+}
+
+func (d *Delegate) RemoveNonVoter(id raft.ServerID) error {
+	d.dl.Lock()
+	delete(d.permanentNonVoters, id)
+	d.dl.Unlock()
+
+	return d.updateNonVoters()
+}
+
+func (d *Delegate) updateNonVoters() error {
+	d.dl.RLock()
+	defer d.dl.RUnlock()
+	v, err := json.Marshal(d.permanentNonVoters)
+	if err != nil {
+		return err
+	}
+	e := physical.Entry{
+		Key:   "autopilot/non-voters",
+		Value: v,
+	}
+
+	return d.Put(context.Background(), &e)
+}
+
+func (d *Delegate) fetchNonVoters() error {
+	e, err := d.Get(context.Background(), "autopilot/non-voters")
+	if err != nil {
+		return err
+	}
+
+	if e == nil {
+		return nil
+	}
+
+	var nonVoters map[raft.ServerID]bool
+	if err := json.Unmarshal(e.Value, &nonVoters); err != nil {
+		return err
+	}
+
+	d.dl.RLock()
+	defer d.dl.RUnlock()
+	if !maps.Equal(d.permanentNonVoters, nonVoters) {
+		d.dl.Lock()
+		d.permanentNonVoters = nonVoters
+		d.dl.Unlock()
+	}
+	return nil
+}
+
+func (d *Delegate) SyncNonVoters() error {
+	state := d.autopilot.GetState()
+
+	if state.Leader == raft.ServerID(d.NodeID()) {
+		return d.updateNonVoters()
+	}
+
+	return d.fetchNonVoters()
 }

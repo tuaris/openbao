@@ -1309,25 +1309,16 @@ func (b *RaftBackend) AddPeer(ctx context.Context, peerID, clusterAddr string, v
 	b.l.RLock()
 	defer b.l.RUnlock()
 
-	// if the peer joins as a non-voter, we append a suffix to the peerID
-	// to make it clear that it's a non-voter
-	var serverID string
-	if voter {
-		serverID = peerID
-	} else {
-		serverID = fmt.Sprintf("%s [non-voter]", peerID)
-	}
-
 	if b.disableAutopilot {
 		if b.raft == nil {
 			return errors.New("raft storage is not initialized")
 		}
-		b.logger.Trace("adding server to raft", "id", serverID)
+		b.logger.Trace("adding server to raft", "id", peerID)
 		var future raft.IndexFuture
 		if voter {
-			future = b.raft.AddVoter(raft.ServerID(serverID), raft.ServerAddress(clusterAddr), 0, 0)
+			future = b.raft.AddVoter(raft.ServerID(peerID), raft.ServerAddress(clusterAddr), 0, 0)
 		} else {
-			future = b.raft.AddNonvoter(raft.ServerID(serverID), raft.ServerAddress(clusterAddr), 0, 0)
+			future = b.raft.AddNonvoter(raft.ServerID(peerID), raft.ServerAddress(clusterAddr), 0, 0)
 		}
 
 		return future.Error()
@@ -1345,10 +1336,13 @@ func (b *RaftBackend) AddPeer(ctx context.Context, peerID, clusterAddr string, v
 		nodeType = autopilot.NodeType("non-voter")
 	}
 
-	b.logger.Debug("adding server to raft via autopilot", "id", serverID)
+	b.logger.Debug("adding server to raft via autopilot", "id", peerID)
+	if !voter {
+		b.logger.Debug("adding non-voter to raft via autopilot", "id", peerID)
+	}
 	return b.autopilot.AddServer(&autopilot.Server{
-		ID:          raft.ServerID(serverID),
-		Name:        serverID,
+		ID:          raft.ServerID(peerID),
+		Name:        peerID,
 		Address:     raft.ServerAddress(clusterAddr),
 		RaftVersion: raft.ProtocolVersionMax,
 		NodeType:    nodeType,
